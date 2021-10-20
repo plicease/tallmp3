@@ -1,0 +1,328 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+use 5.024;
+use Path::Tiny qw( path );
+
+package DB {
+
+  use DBI;
+  use File::Glob qw( bsd_glob );
+
+  my $dbh = DBI->connect("dbi:SQLite:dbname=@{[ bsd_glob '~/.tallmp3' ]}", undef, undef, { RaiseError => 1, AutoCommit => 1 });
+
+  $dbh->do(q{
+    CREATE TABLE IF NOT EXISTS file (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      sha TEXT NOT NULL,
+      size INT NOT NULL,
+      orig_archive TEXT DEFAULT NULL,
+      orig_path TEXT NOT NULL,
+      path TEXT DEFAULT NULL,
+      artist TEXT DEFAULT NULL,
+      album TEXT DEFAULT NULL,
+      title TEXT DEFAULT NULL,
+      disk INT DEFAULT NULL,
+      track INT DEFAULT NULL,
+      version INT DEFAULT NULL,
+      UNIQUE (orig_archive, orig_path)
+    )
+  });
+
+  sub dbh { return $dbh }
+
+}
+
+package File {
+
+  use experimental qw( signatures );
+  use Crypt::Digest::SHA256 qw( sha256_hex sha256_file_hex );
+  use MP3::Tag;
+
+  my $dbh = DB->dbh;
+
+  sub new ($class, $orig_path, $orig_archive=undef, $orig_archive_entry=undef, $orig_content=undef)
+  {
+    my $old = __PACKAGE__->search_orig($orig_path, $orig_archive);
+    return $old if $old;
+
+    my $id;
+    my $size;
+    my $sha;
+
+    if(defined $orig_archive)
+    {
+      $size = $orig_archive_entry->size;
+      $sha = sha256_hex($orig_content);
+    }
+    else
+    {
+      die "no such file: $orig_path" unless -f $orig_path;
+      die "file not readable: $orig_path" unless -r $orig_path;
+      $sha = sha256_file_hex($orig_path);
+      $size = -s $orig_path;
+    }
+
+    #print "$orig_path";
+    #if($orig_archive)
+    #{
+    #  print "     [ ARCHIVE: $orig_archive ]";
+    #}
+    #print "\n";
+
+    $dbh->do(q{
+      INSERT INTO file (sha, orig_archive, orig_path, size) VALUES (?,?,?,?)
+    }, undef, $sha, (defined $orig_archive ? "$orig_archive" : undef), "$orig_path", $size);
+    bless {
+      id           => $dbh->last_insert_id,
+      size         => $size,
+      orig_path    => $orig_path,
+      orig_archive => $orig_archive,
+      sha       => $sha,
+    }, $class;
+  }
+
+  sub search_orig ($class, $orig_path, $orig_archive=undef)
+  {
+    my $sth;
+    if($orig_archive)
+    {
+      $sth = $dbh->prepare(q{
+        SELECT * FROM file WHERE orig_path = ? AND orig_archive = ?
+      });
+      $sth->execute($orig_path, $orig_archive);
+    }
+    else
+    {
+      $sth = $dbh->prepare(q{
+        SELECT * FROM file WHERE orig_path = ? AND orig_archive IS NULL
+      });
+      $sth->execute($orig_path);
+    }
+    my $h = $sth->fetchrow_hashref;
+    defined $h ? bless $h, $class : undef;
+  }
+
+  sub id           { shift->{id}          }
+  sub orig_archive { shift->{orig_arhive} }
+  sub orig_path    { shift->{orig_path}   }
+  sub sha          { shift->{sha}         }
+  sub size         { shift->{size}        }
+
+  sub title   { shift->{title}   }
+  sub track   { shift->{track}   }
+  sub artist  { shift->{artist}  }
+  sub album   { shift->{album}   }
+  sub disk    { shift->{dist}    }
+  sub version { shift->{version} }
+
+  sub get_info ($self, $content=undef)
+  {
+    return if defined $self->version && $self->version == 1;
+    my $path;
+  
+    if($content)
+    {
+      $path = Path::Tiny->tempfile;
+      $path->spew_raw($content);
+    }
+    else
+    {
+      $path = $self->orig_path;
+    }
+
+    my $mp3 = MP3::Tag->new($path);
+    ($self->{title}, undef, $self->{artist}, $self->{album}) = $mp3->autoinfo;
+    $self->{track} = $mp3->track1;
+    $self->{disk} = $mp3->disk1;
+
+    foreach my $key (qw( title artist album track disk ))
+    {
+      $self->{$key} = undef if $self->{$key} eq '';
+    }
+  }
+
+  sub save_info ($self)
+  {
+    $dbh->do(q{
+      UPDATE
+        file
+      SET
+        title   = ?,
+        track   = ?,
+        artist  = ?,
+        album   = ?,
+        disk    = ?,
+        version = ?
+      WHERE
+        id = ?
+    }, undef, $self->title, $self->track, $self->artist, $self->album, $self->disk, 1, $self->id);
+    $self->version(1);
+  }
+
+  sub dir_artist ($self)
+  {
+    my $text = $self->artist // 'unkown';
+    $text =~ s/\s/-/gr;
+  }
+
+  sub dir_album ($self)
+  {
+    my $text = $self->album // 'unknown';
+    $text =~ s/\s/-/g;
+    defined $self->disk
+      ? sprintf '%s-disk-%d', $text, $self->disk
+      : $text;
+  }
+
+  sub file_ext ($self)
+  {
+    Path::Tiny->new($self->orig_path)->basename =~ s/^.*\.//r;
+  }
+
+  sub file_track_title ($self, $count=undef)
+  {
+    my $text = $self->title // 'unknown';
+    $text =~ s/\s/-/g;
+    $text .= "-$count" if defined $count;
+    $text = join '.', $text, $self->file_ext;
+    defined $self->track
+      ? sprintf '%02d-%s', $self->track, $text
+      : $text;
+  }
+
+  sub save_path ($self, $count=undef)
+  {
+    Path::Tiny->new('~/Music')->child('tallmp3')->child($self->dir_artist)->child($self->dir_album)->child($self->file_track_title($count));
+  }
+
+  sub save ($self, $content=undef)
+  {
+    my $sth = $dbh->prepare(q{
+      SELECT
+        orig_path,
+        orig_archive,
+        path
+      FROM
+        file
+      WHERE
+        sha = ? AND
+        size = ? AND
+        path IS NOT NULL
+    });
+
+    $sth->execute($self->sha, $self->size);
+
+    if(my $h = $sth->fetchrow_hashref)
+    {
+      say "Found duplicate of @{[ $self->orig_path ]} at @{[ $h->{orig_path} ]}, skipping";
+      return;
+    }
+
+    my $path = $self->save_path;
+    my $count = 1;
+
+    while(1)
+    {
+      $sth = $dbh->prepare(q{
+        SELECT
+          id
+        FROM
+          file
+        WHERE
+          path = ?
+      });
+
+      $sth->execute($path);
+
+      my $h = $sth->fetchrow_hashref;
+      if(defined $h)
+      {
+        $path = $self->save_path($count++);
+        die "insane number of duplicate names" if $count > 1000;
+      }
+      else
+      {
+        last;
+      }
+    }
+
+    $path->parent->mkpath;
+
+    if($content)
+    {
+      $path->spew_raw($content);
+    }
+    else
+    {
+      Path::Tiny->new($self->orig_path)->copy($path);
+    }
+
+    unless(-f $path)
+    {
+      die "file $path not created";
+    }
+    unless(-r $path)
+    {
+      die "file $path is not readable";
+    }
+
+    my $sha = sha256_file_hex "$path";
+    unless($sha eq $self->sha)
+    {
+      die "sha for $path does not match!";
+    }
+
+    $dbh->do(q{
+      UPDATE
+        file
+      SET
+        path = ?
+      WHERE
+        id = ?
+    }, undef, "$path", $self->id);
+
+  }
+
+}
+
+use Archive::Libarchive::Peek;
+use experimental qw( signatures );
+
+sub process ($path, $=undef)
+{
+  if(-f $path)
+  {
+    if($path->basename =~ /\.(mp3|m4a)$/)
+    {
+      my $file = File->new("$path");
+      $file->get_info;
+      $file->save_info;
+      $file->save;
+    }
+    elsif($path->basename =~ /^takeout-.*\.(tgz|zip)$/)
+    {
+      my $peek = Archive::Libarchive::Peek->new( filename => "$path" );
+      $peek->iterate(sub ($filename, $content, $entry) {
+        return unless $filename =~ /\.(mp3|m4a)$/;
+        my $file = File->new("$filename", "$path", $entry, $content);
+        $file->get_info($content);
+        $file->save_info;
+        $file->save($content);
+      });
+    }
+  }
+}
+
+foreach my $path (map { path($_)->absolute } @ARGV)
+{
+  if(-d $path)
+  {
+    $path->visit(\&process, { recurse => 1 });
+  }
+  elsif(-f $path)
+  {
+    process($path);
+  }
+}
